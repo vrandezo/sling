@@ -16,6 +16,7 @@
 import pywikibot
 import sling
 import json
+import gzip
 import sys
 import datetime
 import sling.flags as flags
@@ -50,6 +51,11 @@ flags.define("--input",
              default="birth-dates",
              type=str)
 
+flags.define("--deletions",
+             help="gzipped file with all deleted triples",
+             default="deletions.triples.gz",
+             type=str)
+
 
 precision_map = {
   sling.MILLENNIUM: pywikibot.WbTime.PRECISION['millenia'],
@@ -59,6 +65,54 @@ precision_map = {
   sling.MONTH: pywikibot.WbTime.PRECISION['month'],
   sling.DAY: pywikibot.WbTime.PRECISION['day']
 }
+
+class Deletions:
+  """Class to cache deletions."""
+  def __init__(self):
+    self.path = None
+    self.epoch = None
+    self.deletions = {}
+
+  def set_deletions_path(self, path):
+    self.path = path
+
+  def load(self, property_ids):
+    """Loads the deletion triples for the given properties.
+    
+    Call this with a list of string property IDs, e.g. load(["P69", "P106"]).
+    If you don't call it before calling contains, contains will call it implicitly.
+    It will speed things up to call it only once with all relevant properties.
+    """
+    for p in property_ids:
+      self.deletions[p] = {}
+    for triple in gzip.open(self.path):
+      try:
+        s, p, o = triple.decode().strip().split(' ', 2)
+        if p not in property_ids: continue
+        if s not in self.deletions[p]: self.deletions[p][s] = []
+        self.deletions[p][s].append(o)
+      except ValueError:
+        pass
+
+  def contains(self, subject_id, property_id, object_value):
+    """Checks if a given triple was previously deleted."""
+    if self.path is None: return False
+    if property_id not in self.deletions:
+      self.load_deletions([property_id])
+    if subject_id not in self.deletions[property_id]: return False
+    return object_value in self.deletions[property_id][subject_id]
+
+  def timestamp(self):
+    """Returns how current the deletion file is."""
+    if self.epoch is not None: return self.timestamp
+    self.epoch = '20120901000000'  # before Wikidata epoch
+    if self.path is None: return self.epoch
+    for line in gzip.open(self.path):
+      if line.decode().strip().startswith('# timestamp: '):
+        self.epoch = line.decode().strip()[13:]
+        return self.epoch
+    return self.epoch
+
 
 class StoreFactsBot:
   def __init__(self):
@@ -74,6 +128,10 @@ class StoreFactsBot:
     status_file_name = "local/logs/wikibotlog-" + time_str + ".rec"
     self.record_file = sling.RecordReader(record_file_name)
     self.status_file = sling.RecordWriter(status_file_name)
+    
+    self.deletions = Deletions()
+    if flags.arg.deletions:
+      self.deletions.set_deletions_path(flags.arg.deletions)
 
     self.store = sling.Store()
     self.store.lockgc()
@@ -197,8 +255,9 @@ class StoreFactsBot:
     return False
 
   def ever_had(self, wd_item, prop, target):
-    # Up to 150 revisions covers the full history of 99% human items
-    revisions = wd_item.revisions(total=150, content=True)
+    in_deletions = self.deletions.contains(wd_item.title(), prop, target)
+    if in_deletions: return True
+    revisions = wd_item.revisions(starttime=self.deletions.timestamp(), content=True)
     for revision in revisions:
       try:
         revision_text = json.loads(revision.text)
